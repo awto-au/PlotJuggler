@@ -56,9 +56,15 @@ public:
     return false;
   }
 
+  virtual const std::vector<QAction*>& availableActions() override;
+
 private:
   bool _running;
   QUdpSocket* _udp_socket;
+  std::vector<QAction*> _actions;
+
+  void configure();
+  bool startSocket(const QString& address_str, int port);
 
   // Kept so we can lazily create parsers per discriminator ID.
   PJ::ParserFactoryPlugin::Ptr _parser_creator;

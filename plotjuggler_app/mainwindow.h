@@ -13,6 +13,8 @@
 
 #include <QCommandLineParser>
 #include <QElapsedTimer>
+#include <QJsonObject>
+#include <QLabel>
 #include <QMainWindow>
 #include <QSignalMapper>
 #include <QShortcut>
@@ -53,6 +55,10 @@ public:
 
   void stopStreamingPlugin();
   void startStreamingPlugin(QString streamer_name);
+
+  // WebSocket control channel
+  QString getStateJSON() const;
+  void broadcastState();
   void enableStreamingNotificationsButton(bool enabled);
 
   void setStatusBarMessage(QString message);
@@ -63,6 +69,8 @@ public:
   void showToast(const QString& message, const QPixmap& icon = QPixmap());
 
 public slots:
+
+  void handleControlCommand(QJsonObject cmd);
 
   void resizeEvent(QResizeEvent*);
   // Undo - Redo
@@ -132,10 +140,17 @@ private:
   TransformsMap _transform_functions;
 
   QString _default_streamer;
+  bool _autostart_streamer;
 
   ParserFactories _parser_factories;
 
   std::shared_ptr<DataStreamer> _active_streamer_plugin;
+
+  // WebSocket control channel — null when WebSocket Server plugin is not loaded.
+  // Stored as QObject* because the plugin is loaded at runtime, not linked.
+  QObject* _ws_control = nullptr;
+  bool _port_controlled = false;
+  QLabel* _port_controlled_label = nullptr;
 
   std::deque<QDomDocument> _undo_states;
   std::deque<QDomDocument> _redo_states;

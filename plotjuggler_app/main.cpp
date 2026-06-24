@@ -320,6 +320,12 @@ int main(int argc, char* argv[])
       "Automatically start a Streaming Plugin with the given file_name (no extension)");
   parser.addOption(start_streamer);
 
+  QCommandLineOption autostart_streamer_option(
+      QStringList() << "autostart-streamer",
+      "When loading a layout, automatically start the previously used streaming plugin "
+      "without prompting. Requires --layout with a previouslyLoaded_Streamer entry.");
+  parser.addOption(autostart_streamer_option);
+
   QCommandLineOption window_title(QStringList() << "window_title", "Set the window title",
                                   "window_title");
   parser.addOption(window_title);

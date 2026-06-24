@@ -27,6 +27,8 @@ THE SOFTWARE.
 #include <QIntValidator>
 #include <QMessageBox>
 #include <chrono>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 #include "ui_websocket_server.h"
 #include "PlotJuggler/dialog_utils.h"
@@ -66,29 +68,52 @@ WebsocketServer::~WebsocketServer()
   shutdown();
 }
 
+// start() uses stored QSettings — no dialog. Use gear icon "Configure..." to change port.
 bool WebsocketServer::start(QStringList*)
 {
   if (_running)
-  {
     return _running;
-  }
 
   if (parserFactories() == nullptr || parserFactories()->empty())
   {
-    QMessageBox::warning(nullptr, tr("Websocket Server"), tr("No available MessageParsers"),
+    QMessageBox::warning(nullptr, tr("WebSocket Server"), tr("No available MessageParsers"),
                          QMessageBox::Ok);
     _running = false;
     return false;
   }
 
-  bool ok = false;
+  QSettings settings;
+  QString protocol = settings.value("WebsocketServer::protocol", "JSON").toString();
+  if (parserFactories()->find(protocol) == parserFactories()->end())
+    protocol = parserFactories()->begin()->first;
+  int port = settings.value("WebsocketServer::port", 9871).toInt();
+
+  _parser = parserFactories()->at(protocol)->createParser({}, {}, {}, dataMap());
+
+  if (_server.listen(QHostAddress::Any, port))
+  {
+    qDebug() << "WebSocket control+data server listening on port" << port;
+    _running = true;
+  }
+  else
+  {
+    QMessageBox::warning(nullptr, tr("WebSocket Server"),
+                         tr("Couldn't open WebSocket on port %1").arg(port), QMessageBox::Ok);
+    _running = false;
+  }
+  return _running;
+}
+
+void WebsocketServer::configure()
+{
+  if (parserFactories() == nullptr || parserFactories()->empty())
+    return;
 
   WebsocketDialog* dialog = new WebsocketDialog();
 
   for (const auto& it : *parserFactories())
   {
     dialog->ui->comboBoxProtocol->addItem(it.first);
-
     if (auto widget = it.second->optionsWidget())
     {
       widget->setVisible(false);
@@ -96,65 +121,51 @@ bool WebsocketServer::start(QStringList*)
     }
   }
 
-  // load previous values
   QSettings settings;
-  QString protocol = settings.value("WebsocketServer::protocol", "JSON").toString();
-  if (parserFactories()->find(protocol) == parserFactories()->end())
+  dialog->ui->lineEditPort->setText(
+      QString::number(settings.value("WebsocketServer::port", 9871).toInt()));
+  dialog->ui->comboBoxProtocol->setCurrentText(
+      settings.value("WebsocketServer::protocol", "JSON").toString());
+
+  if (dialog->exec() != QDialog::Accepted)
   {
-    protocol = parserFactories()->begin()->first;
-  }
-  int port = settings.value("WebsocketServer::port", 9871).toInt();
-
-  dialog->ui->lineEditPort->setText(QString::number(port));
-
-  ParserFactoryPlugin::Ptr parser_creator;
-
-  connect(dialog->ui->comboBoxProtocol, qOverload<const QString&>(&QComboBox::currentIndexChanged),
-          this, [this, dialog, &parser_creator](const QString& selected_protocol) {
-            if (parser_creator)
-            {
-              if (auto prev_widget = parser_creator->optionsWidget())
-              {
-                prev_widget->setVisible(false);
-              }
-            }
-            parser_creator = parserFactories()->at(selected_protocol);
-
-            showOptionsWidget(dialog, dialog->ui->boxOptions, parser_creator->optionsWidget());
-          });
-
-  dialog->ui->comboBoxProtocol->setCurrentText(protocol);
-
-  int res = dialog->exec();
-  if (res == QDialog::Rejected)
-  {
-    _running = false;
-    return false;
+    dialog->deleteLater();
+    return;
   }
 
-  port = dialog->ui->lineEditPort->text().toUShort(&ok);
-  protocol = dialog->ui->comboBoxProtocol->currentText();
+  bool ok = false;
+  int port = dialog->ui->lineEditPort->text().toUShort(&ok);
+  QString protocol = dialog->ui->comboBoxProtocol->currentText();
   dialog->deleteLater();
 
-  _parser = parser_creator->createParser({}, {}, {}, dataMap());
-
-  // save back to service
-  settings.setValue("WebsocketServer::protocol", protocol);
   settings.setValue("WebsocketServer::port", port);
+  settings.setValue("WebsocketServer::protocol", protocol);
 
-  if (_server.listen(QHostAddress::Any, port))
+  if (_running)
   {
-    qDebug() << "Websocket listening on port" << port;
-    _running = true;
+    shutdown();
+    start(nullptr);
   }
-  else
-  {
-    QMessageBox::warning(nullptr, tr("Websocket Server"),
-                         tr("Couldn't open websocket on port %1").arg(port), QMessageBox::Ok);
-    _running = false;
-  }
+}
 
-  return _running;
+const std::vector<QAction*>& WebsocketServer::availableActions()
+{
+  if (_actions.empty())
+  {
+    auto* action = new QAction(tr("Configure WebSocket Server..."), this);
+    connect(action, &QAction::triggered, this, &WebsocketServer::configure);
+    _actions.push_back(action);
+  }
+  return _actions;
+}
+
+void WebsocketServer::sendToAll(const QString& msg)
+{
+  for (QWebSocket* client : _clients)
+  {
+    if (client->isValid())
+      client->sendTextMessage(msg);
+  }
 }
 
 void WebsocketServer::shutdown()
@@ -173,10 +184,30 @@ void WebsocketServer::onNewConnection()
   connect(pSocket, &QWebSocket::textMessageReceived, this, &WebsocketServer::processMessage);
   connect(pSocket, &QWebSocket::disconnected, this, &WebsocketServer::socketDisconnected);
   _clients << pSocket;
+  qDebug() << "WebSocket client connected:" << pSocket->peerAddress().toString();
 }
 
 void WebsocketServer::processMessage(QString message)
 {
+  QJsonParseError err;
+  QJsonDocument doc = QJsonDocument::fromJson(message.toUtf8(), &err);
+
+  if (err.error != QJsonParseError::NoError || !doc.isObject())
+  {
+    qDebug() << "WebSocket: invalid JSON:" << err.errorString();
+    return;
+  }
+
+  QJsonObject obj = doc.object();
+
+  // Control message: has a "cmd" key — dispatch to MainWindow, not to parser.
+  if (obj.contains("cmd"))
+  {
+    emit commandReceived(obj);
+    return;
+  }
+
+  // Data message: forward to parser as before.
   std::lock_guard<std::mutex> lock(mutex());
 
   using namespace std::chrono;
@@ -192,8 +223,8 @@ void WebsocketServer::processMessage(QString message)
   }
   catch (std::exception& err)
   {
-    QMessageBox::warning(nullptr, tr("Websocket Server"),
-                         tr("Problem parsing the message. Websocket Server will be "
+    QMessageBox::warning(nullptr, tr("WebSocket Server"),
+                         tr("Problem parsing the message. WebSocket Server will be "
                             "stopped.\n%1")
                              .arg(err.what()),
                          QMessageBox::Ok);
@@ -202,7 +233,6 @@ void WebsocketServer::processMessage(QString message)
     return;
   }
   emit dataReceived();
-  return;
 }
 
 void WebsocketServer::socketDisconnected()

@@ -59,7 +59,7 @@ public:
   Ui::UDPServerDialog* ui;
 };
 
-UDP_Server::UDP_Server() : _running(false)
+UDP_Server::UDP_Server() : _running(false), _udp_socket(nullptr)
 {
 }
 
@@ -116,12 +116,68 @@ UDP_Server::~UDP_Server()
   shutdown();
 }
 
+bool UDP_Server::startSocket(const QString& address_str, int port)
+{
+  QHostAddress address(address_str);
+  bool success = !address.isNull();
+
+  _udp_socket = new QUdpSocket();
+  int ip_version = (address.protocol() == QAbstractSocket::IPv6Protocol) ? 6 : 4;
+
+  if (!address.isMulticast())
+  {
+    success &= _udp_socket->bind(address, port,
+                                 QAbstractSocket::ShareAddress | QAbstractSocket::ReuseAddressHint);
+  }
+  else
+  {
+    QHostAddress bind_address =
+        (ip_version == 6) ? QHostAddress::AnyIPv6 : address;
+    success &= _udp_socket->bind(bind_address, port,
+                                 QAbstractSocket::ShareAddress | QAbstractSocket::ReuseAddressHint);
+    if (success)
+    {
+      bool bound_one = false;
+      for (const auto& iface : QNetworkInterface::allInterfaces())
+      {
+        auto fl = iface.flags();
+        if (iface.isValid() && !fl.testFlag(QNetworkInterface::IsLoopBack) &&
+            fl.testFlag(QNetworkInterface::CanMulticast) &&
+            fl.testFlag(QNetworkInterface::IsRunning))
+        {
+          if (_udp_socket->joinMulticastGroup(address, iface))
+            bound_one = true;
+        }
+      }
+      success &= bound_one;
+    }
+  }
+
+  _running = true;
+  connect(_udp_socket, &QUdpSocket::readyRead, this, &UDP_Server::processMessage);
+
+  if (success)
+  {
+    qDebug() << tr("IPv%3 UDP listening on (%1, %2)").arg(address_str).arg(port).arg(ip_version);
+  }
+  else
+  {
+    QMessageBox::warning(nullptr, tr("UDP Server"),
+                         tr("Couldn't bind to IPv%3 UDP socket (%1, %2)")
+                             .arg(address_str)
+                             .arg(port)
+                             .arg(ip_version),
+                         QMessageBox::Ok);
+    shutdown();
+  }
+  return _running;
+}
+
+// start() uses stored QSettings — no dialog. Use the gear icon "Configure..." to change settings.
 bool UDP_Server::start(QStringList*)
 {
   if (_running)
-  {
     return _running;
-  }
 
   if (parserFactories() == nullptr || parserFactories()->empty())
   {
@@ -131,14 +187,38 @@ bool UDP_Server::start(QStringList*)
     return false;
   }
 
-  bool ok = false;
+  QSettings settings;
+  QString address_str = settings.value("UDP_Server::address", "127.0.0.1").toString();
+  int port = settings.value("UDP_Server::port", 9870).toInt();
+  QString protocol = settings.value("UDP_Server::protocol", "JSON").toString();
+  if (parserFactories()->find(protocol) == parserFactories()->end())
+  {
+    protocol = parserFactories()->begin()->first;
+  }
+
+  _dispatch_enabled = settings.value("UDP_Server::dispatch_enabled", false).toBool();
+  _dispatch_offset = settings.value("UDP_Server::dispatch_offset", 0).toInt();
+  _dispatch_length = settings.value("UDP_Server::dispatch_length", 1).toInt();
+  _dispatch_little_endian = settings.value("UDP_Server::dispatch_little_endian", true).toBool();
+  _dispatch_display_hex = settings.value("UDP_Server::dispatch_display_hex", false).toBool();
+
+  _parser_creator = parserFactories()->at(protocol);
+  _parsers.clear();
+
+  return startSocket(address_str, port);
+}
+
+// Opens the config dialog. If accepted, saves settings and restarts if currently running.
+void UDP_Server::configure()
+{
+  if (parserFactories() == nullptr || parserFactories()->empty())
+    return;
 
   UdpServerDialog dialog;
 
   for (const auto& it : *parserFactories())
   {
     dialog.ui->comboBoxProtocol->addItem(it.first);
-
     if (auto widget = it.second->optionsWidget())
     {
       widget->setVisible(false);
@@ -146,21 +226,16 @@ bool UDP_Server::start(QStringList*)
     }
   }
 
-  // load previous values
   QSettings settings;
   QString address_str = settings.value("UDP_Server::address", "127.0.0.1").toString();
   int port = settings.value("UDP_Server::port", 9870).toInt();
-  QString protocol = settings.value("UDP_Server::protocol").toString();
+  QString protocol = settings.value("UDP_Server::protocol", "JSON").toString();
   if (parserFactories()->find(protocol) == parserFactories()->end())
-  {
     protocol = parserFactories()->begin()->first;
-  }
 
   dialog.ui->lineEditAddress->setText(address_str);
   dialog.ui->lineEditPort->setText(QString::number(port));
-
-  dialog.ui->groupBoxDispatch->setChecked(
-      settings.value("UDP_Server::dispatch_enabled", false).toBool());
+  dialog.ui->groupBoxDispatch->setChecked(settings.value("UDP_Server::dispatch_enabled", false).toBool());
   dialog.ui->spinBoxOffset->setValue(settings.value("UDP_Server::dispatch_offset", 0).toInt());
   dialog.ui->comboBoxLength->setCurrentIndex(
       comboFromLength(settings.value("UDP_Server::dispatch_length", 1).toInt()));
@@ -171,16 +246,11 @@ bool UDP_Server::start(QStringList*)
 
   ParserFactoryPlugin::Ptr parser_creator;
 
-  auto onComboChanged = [this, &dialog, &parser_creator](const QString& selected_protocol) {
+  auto onComboChanged = [this, &dialog, &parser_creator](const QString& selected) {
     if (parser_creator)
-    {
-      if (auto prev_widget = parser_creator->optionsWidget())
-      {
-        prev_widget->setVisible(false);
-      }
-    }
-    parser_creator = parserFactories()->at(selected_protocol);
-
+      if (auto prev = parser_creator->optionsWidget())
+        prev->setVisible(false);
+    parser_creator = parserFactories()->at(selected);
     showOptionsWidget(&dialog, dialog.ui->boxOptions, parser_creator->optionsWidget());
   };
 
@@ -190,115 +260,50 @@ bool UDP_Server::start(QStringList*)
   dialog.ui->comboBoxProtocol->setCurrentText(protocol);
   onComboChanged(protocol);
 
-  int res = dialog.exec();
-  if (res == QDialog::Rejected)
-  {
-    _running = false;
-    return false;
-  }
+  if (dialog.exec() != QDialog::Accepted)
+    return;
 
+  bool ok = false;
   address_str = dialog.ui->lineEditAddress->text();
   port = dialog.ui->lineEditPort->text().toUShort(&ok);
   protocol = dialog.ui->comboBoxProtocol->currentText();
 
-  _parser_creator = parser_creator;
-  _parsers.clear();
-
-  _dispatch_enabled = dialog.ui->groupBoxDispatch->isChecked();
-  _dispatch_offset = dialog.ui->spinBoxOffset->value();
-  _dispatch_length = lengthFromCombo(dialog.ui->comboBoxLength->currentIndex());
-  _dispatch_little_endian = (dialog.ui->comboBoxEndian->currentIndex() == 0);
-  _dispatch_display_hex = (dialog.ui->comboBoxDisplay->currentIndex() == 1);
-
-  // save back to service
-  settings.setValue("UDP_Server::protocol", protocol);
   settings.setValue("UDP_Server::address", address_str);
   settings.setValue("UDP_Server::port", port);
-  settings.setValue("UDP_Server::dispatch_enabled", _dispatch_enabled);
-  settings.setValue("UDP_Server::dispatch_offset", _dispatch_offset);
-  settings.setValue("UDP_Server::dispatch_length", _dispatch_length);
-  settings.setValue("UDP_Server::dispatch_little_endian", _dispatch_little_endian);
-  settings.setValue("UDP_Server::dispatch_display_hex", _dispatch_display_hex);
+  settings.setValue("UDP_Server::protocol", protocol);
+  settings.setValue("UDP_Server::dispatch_enabled", dialog.ui->groupBoxDispatch->isChecked());
+  settings.setValue("UDP_Server::dispatch_offset", dialog.ui->spinBoxOffset->value());
+  settings.setValue("UDP_Server::dispatch_length",
+                    lengthFromCombo(dialog.ui->comboBoxLength->currentIndex()));
+  settings.setValue("UDP_Server::dispatch_little_endian",
+                    dialog.ui->comboBoxEndian->currentIndex() == 0);
+  settings.setValue("UDP_Server::dispatch_display_hex",
+                    dialog.ui->comboBoxDisplay->currentIndex() == 1);
 
-  QHostAddress address(address_str);
-
-  bool success = true;
-  success &= !address.isNull();
-
-  _udp_socket = new QUdpSocket();
-  int ip_version = 4;
-  if (address.protocol() == QAbstractSocket::IPv6Protocol)
+  // Restart with new settings if already running.
+  if (_running)
   {
-    ip_version = 6;
-  }
-
-  if (!address.isMulticast())
-  {
-    success &= _udp_socket->bind(address, port);
-  }
-  else
-  {
-    QHostAddress bind_address = address;
-    if (ip_version == 6)
-    {
-      // IPv6 multicast needs to bind to AnyIPv6
-      bind_address = QHostAddress::AnyIPv6;
-    }
-    success &= _udp_socket->bind(bind_address, port,
-                                 QAbstractSocket::ShareAddress | QAbstractSocket::ReuseAddressHint);
-    if (!success)
-    {
-      qDebug() << tr("Couldn't bind IPv%3 UDP socket (%1, %2)")
-                      .arg(address_str)
-                      .arg(port)
-                      .arg(ip_version);
-    }
-
-    // Add multicast group membership to all interfaces which support multicast.
-    bool bound_one_interface = false;
-    for (const auto& interface : QNetworkInterface::allInterfaces())
-    {
-      QNetworkInterface::InterfaceFlags iflags = interface.flags();
-      if (success && interface.isValid() && !iflags.testFlag(QNetworkInterface::IsLoopBack) &&
-          iflags.testFlag(QNetworkInterface::CanMulticast) &&
-          iflags.testFlag(QNetworkInterface::IsRunning))
-      {
-        if (_udp_socket->joinMulticastGroup(address, interface))
-        {
-          bound_one_interface = true;
-        }
-        else
-        {
-          qDebug() << tr("Couldn't join IPv%4 multicast group (%1, %2) on interface %3")
-                          .arg(address_str)
-                          .arg(port)
-                          .arg(interface.name().arg(ip_version));
-        }
-      }
-    }
-    success &= bound_one_interface;
-  }
-
-  _running = true;
-
-  connect(_udp_socket, &QUdpSocket::readyRead, this, &UDP_Server::processMessage);
-
-  if (success)
-  {
-    qDebug() << tr("IPv%3 UDP listening on (%1, %2)").arg(address_str).arg(port).arg(ip_version);
-  }
-  else
-  {
-    QMessageBox::warning(nullptr, tr("UDP Server"),
-                         tr("Couldn't bind to IPv%4 UDP server at (%1, %2)")
-                             .arg(address_str)
-                             .arg(port)
-                             .arg(ip_version),
-                         QMessageBox::Ok);
     shutdown();
+    _parser_creator = parser_creator;
+    _parsers.clear();
+    _dispatch_enabled = settings.value("UDP_Server::dispatch_enabled").toBool();
+    _dispatch_offset = settings.value("UDP_Server::dispatch_offset").toInt();
+    _dispatch_length = settings.value("UDP_Server::dispatch_length").toInt();
+    _dispatch_little_endian = settings.value("UDP_Server::dispatch_little_endian").toBool();
+    _dispatch_display_hex = settings.value("UDP_Server::dispatch_display_hex").toBool();
+    startSocket(address_str, port);
   }
+}
 
-  return _running;
+const std::vector<QAction*>& UDP_Server::availableActions()
+{
+  if (_actions.empty())
+  {
+    auto* action = new QAction(tr("Configure UDP Server..."), this);
+    connect(action, &QAction::triggered, this, &UDP_Server::configure);
+    _actions.push_back(action);
+  }
+  return _actions;
 }
 
 void UDP_Server::shutdown()
@@ -331,10 +336,7 @@ void UDP_Server::processMessage()
     {
       const int header_end = _dispatch_offset + _dispatch_length;
       if (size < header_end)
-      {
-        // Packet too short for the declared discriminator; drop.
         continue;
-      }
       uint64_t id =
           decodeUnsigned(bytes + _dispatch_offset, _dispatch_length, _dispatch_little_endian);
       char buf[32];
@@ -349,12 +351,9 @@ void UDP_Server::processMessage()
     try
     {
       std::lock_guard<std::mutex> lock(mutex());
-      // important use the mutex to protect any access to the data
       auto it = _parsers.find(topic);
       if (it == _parsers.end())
-      {
         it = _parsers.emplace(topic, _parser_creator->createParser(topic, {}, {}, dataMap())).first;
-      }
       it->second->parseMessage(msg, timestamp);
     }
     catch (std::exception& err)
@@ -365,12 +364,9 @@ void UDP_Server::processMessage()
                                .arg(err.what()),
                            QMessageBox::Ok);
       shutdown();
-      // notify the GUI
       emit closed();
       return;
     }
   }
-  // notify the GUI
   emit dataReceived();
-  return;
 }

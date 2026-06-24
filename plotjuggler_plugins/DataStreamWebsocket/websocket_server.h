@@ -19,6 +19,7 @@ THE SOFTWARE.
 #include <QWebSocketServer>
 #include <QWebSocket>
 #include <QList>
+#include <QJsonObject>
 
 #include <QtPlugin>
 #include <thread>
@@ -57,11 +58,24 @@ public:
     return false;
   }
 
+  virtual const std::vector<QAction*>& availableActions() override;
+
+public slots:
+  // Broadcast a text message to all connected clients.
+  void sendToAll(const QString& msg);
+
+signals:
+  // Emitted when a client sends a {"cmd": ...} control message.
+  void commandReceived(QJsonObject cmd);
+
 private:
   bool _running;
   QList<QWebSocket*> _clients;
   QWebSocketServer _server;
   PJ::MessageParserPtr _parser;
+  std::vector<QAction*> _actions;
+
+  void configure();
 
 private slots:
   void onNewConnection();
