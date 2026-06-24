@@ -64,6 +64,10 @@
 #include "cheatsheet/cheatsheet_dialog.h"
 #include "colormap_editor.h"
 
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+
 #ifdef COMPILED_WITH_CATKIN
 
 #endif
@@ -519,6 +523,7 @@ void MainWindow::onUndoableChange()
     _undo_states.pop_front();
   }
   _undo_states.push_back(xmlSaveState());
+  broadcastState();
   _redo_states.clear();
   // qDebug() << "undo " << _undo_states.size();
 }
@@ -883,6 +888,25 @@ void MainWindow::initializePlugins()
 
     bool contains_options = !streamer_it->second->availableActions().empty();
     ui->buttonStreamingOptions->setEnabled(contains_options);
+
+    // Wire the WebSocket Server as the bidirectional control channel.
+    // Stored as QObject* because the plugin is a runtime-loaded shared library.
+    auto ws_it = data_streamers.find("WebSocket Server");
+    if (ws_it != data_streamers.end())
+    {
+      _ws_control = ws_it->second.get();
+
+      // commandReceived(QJsonObject) is a signal on the plugin; connect via string macro
+      // so no compile-time link to the plugin is needed.
+      connect(_ws_control, SIGNAL(commandReceived(QJsonObject)),
+              this, SLOT(handleControlCommand(QJsonObject)));
+
+      _port_controlled_label = new QLabel("  \U0001F512 Controlled by port  ", this);
+      _port_controlled_label->setStyleSheet(
+          "QLabel { background: #c0392b; color: white; font-weight: bold; padding: 2px 8px; }");
+      _port_controlled_label->setVisible(false);
+      statusBar()->addPermanentWidget(_port_controlled_label);
+    }
   }
 }
 
@@ -3758,4 +3782,231 @@ void MainWindow::on_buttonShowpoint_toggled(bool checked)
 void MainWindow::on_buttonDots_toggled(bool checked)
 {
   forEachWidget([&](PlotWidget* plot) { plot->changeDots(checked); });
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket control channel
+// ---------------------------------------------------------------------------
+
+QString MainWindow::getStateJSON() const
+{
+  QJsonObject root;
+  root["event"] = "state";
+  root["streaming"] = isStreamingActive();
+  root["streamer"] = _active_streamer_plugin
+                         ? QString(_active_streamer_plugin->name())
+                         : QString();
+  root["port_controlled"] = _port_controlled;
+
+  QJsonArray tabs_arr;
+  for (const auto& [tw_name, tw] : TabbedPlotWidget::instances())
+  {
+    QTabWidget* tab_widget = tw->tabWidget();
+    for (int t = 0; t < tab_widget->count(); ++t)
+    {
+      PlotDocker* docker = dynamic_cast<PlotDocker*>(tab_widget->widget(t));
+      if (!docker)
+        continue;
+
+      QJsonArray panes_arr;
+      for (int p = 0; p < docker->plotCount(); ++p)
+      {
+        PlotWidget* plot = docker->plotAt(p);
+
+        // Recover pane name from the parent DockWidget's toolbar label.
+        QString pane_name;
+        if (auto* dock_area = docker->dockArea(p))
+        {
+          if (auto* dw = dynamic_cast<DockWidget*>(dock_area->currentDockWidget()))
+            pane_name = dw->name();
+        }
+
+        QJsonArray curves_arr;
+        for (const auto& [name, color] : plot->getCurveColors())
+        {
+          QJsonObject c;
+          c["name"] = name;
+          c["color"] = color.name();
+          curves_arr.append(c);
+        }
+
+        QJsonObject pane;
+        pane["name"] = pane_name;
+        pane["curves"] = curves_arr;
+        panes_arr.append(pane);
+      }
+
+      QJsonObject tab;
+      tab["name"] = tab_widget->tabText(t);
+      tab["panes"] = panes_arr;
+      tabs_arr.append(tab);
+    }
+  }
+  root["tabs"] = tabs_arr;
+
+  return QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Compact));
+}
+
+void MainWindow::broadcastState()
+{
+  if (!_ws_control)
+    return;
+  // Use invokeMethod so we don't need a compile-time link to the plugin library.
+  QMetaObject::invokeMethod(_ws_control, "sendToAll",
+                            Qt::DirectConnection,
+                            Q_ARG(QString, getStateJSON()));
+}
+
+void MainWindow::handleControlCommand(QJsonObject cmd)
+{
+  const QString c = cmd.value("cmd").toString();
+
+  if (c == "get_state")
+  {
+    broadcastState();
+  }
+  else if (c == "shutdown")
+  {
+    QApplication::quit();
+  }
+  else if (c == "clear")
+  {
+    on_actionDeleteAllData_triggered();
+  }
+  else if (c == "load_layout")
+  {
+    QString path = cmd.value("path").toString();
+    if (!path.isEmpty())
+      loadLayoutFromFile(path);
+  }
+  else if (c == "save_layout")
+  {
+    QString path = cmd.value("path").toString();
+    if (!path.isEmpty())
+    {
+      QFile f(path);
+      if (f.open(QIODevice::WriteOnly))
+      {
+        QDomDocument doc = xmlSaveState();
+        f.write(doc.toByteArray(2));
+      }
+    }
+  }
+  else if (c == "lock")
+  {
+    _port_controlled = true;
+    if (_port_controlled_label)
+      _port_controlled_label->setVisible(true);
+    broadcastState();
+  }
+  else if (c == "unlock")
+  {
+    _port_controlled = false;
+    if (_port_controlled_label)
+      _port_controlled_label->setVisible(false);
+    broadcastState();
+  }
+  else if (c == "start_streaming")
+  {
+    if (ui->buttonStreamingStart->text() == "Start")
+      on_buttonStreamingStart_clicked();
+  }
+  else if (c == "stop_streaming")
+  {
+    if (ui->buttonStreamingStart->text() == "Stop")
+      on_buttonStreamingStart_clicked();
+  }
+  else if (c == "set_color")
+  {
+    QString curve = cmd.value("curve").toString();
+    QColor color(cmd.value("color").toString());
+    if (!curve.isEmpty() && color.isValid())
+    {
+      forEachWidget([&](PlotWidget* plot) {
+        plot->on_changeCurveColor(curve, color);
+      });
+      onUndoableChange();
+    }
+  }
+  else if (c == "add_curve")
+  {
+    QString tab_name = cmd.value("tab").toString();
+    QString pane_name = cmd.value("pane").toString();
+    QString curve = cmd.value("curve").toString();
+    QColor color(cmd.value("color").toString("#00000000"));
+
+    if (curve.isEmpty())
+      return;
+
+    // Ensure the series exists in the data map.
+    if (_mapped_plot_data.numeric.count(curve.toStdString()) == 0)
+      _mapped_plot_data.addNumeric(curve.toStdString());
+
+    for (const auto& [tw_name, tw] : TabbedPlotWidget::instances())
+    {
+      QTabWidget* tab_widget = tw->tabWidget();
+      for (int t = 0; t < tab_widget->count(); ++t)
+      {
+        if (!tab_name.isEmpty() && tab_widget->tabText(t) != tab_name)
+          continue;
+        PlotDocker* docker = dynamic_cast<PlotDocker*>(tab_widget->widget(t));
+        if (!docker)
+          continue;
+        for (int p = 0; p < docker->plotCount(); ++p)
+        {
+          PlotWidget* plot = docker->plotAt(p);
+          if (!pane_name.isEmpty())
+          {
+            auto* area = docker->dockArea(p);
+            auto* dw = area ? dynamic_cast<DockWidget*>(area->currentDockWidget()) : nullptr;
+            if (!dw || dw->name() != pane_name)
+              continue;
+          }
+          plot->addCurve(curve.toStdString(), color);
+          plot->replot();
+        }
+      }
+    }
+    onUndoableChange();
+  }
+  else if (c == "remove_curve")
+  {
+    QString tab_name = cmd.value("tab").toString();
+    QString pane_name = cmd.value("pane").toString();
+    QString curve = cmd.value("curve").toString();
+
+    if (curve.isEmpty())
+      return;
+
+    for (const auto& [tw_name, tw] : TabbedPlotWidget::instances())
+    {
+      QTabWidget* tab_widget = tw->tabWidget();
+      for (int t = 0; t < tab_widget->count(); ++t)
+      {
+        if (!tab_name.isEmpty() && tab_widget->tabText(t) != tab_name)
+          continue;
+        PlotDocker* docker = dynamic_cast<PlotDocker*>(tab_widget->widget(t));
+        if (!docker)
+          continue;
+        for (int p = 0; p < docker->plotCount(); ++p)
+        {
+          PlotWidget* plot = docker->plotAt(p);
+          if (!pane_name.isEmpty())
+          {
+            auto* area = docker->dockArea(p);
+            auto* dw = area ? dynamic_cast<DockWidget*>(area->currentDockWidget()) : nullptr;
+            if (!dw || dw->name() != pane_name)
+              continue;
+          }
+          plot->removeCurve(curve);
+          plot->replot();
+        }
+      }
+    }
+    onUndoableChange();
+  }
+  else
+  {
+    qDebug() << "WebSocket control: unknown command:" << c;
+  }
 }
