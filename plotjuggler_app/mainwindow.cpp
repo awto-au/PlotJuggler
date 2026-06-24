@@ -180,6 +180,7 @@ MainWindow::MainWindow(const QCommandLineParser& commandline_parser, QWidget* pa
 
   _test_option = commandline_parser.isSet("test");
   _autostart_publishers = commandline_parser.isSet("publish");
+  _autostart_streamer = commandline_parser.isSet("autostart-streamer");
 
   if (commandline_parser.isSet("enabled_plugins"))
   {
@@ -2178,16 +2179,21 @@ bool MainWindow::loadLayoutFromFile(QString filename, bool load_datafiles)
   {
     QString streamer_name = previous_streamer.attribute("name");
 
-    QMessageBox msgBox(this);
-    msgBox.setWindowTitle("Start Streaming?");
-    msgBox.setText(
-        tr("Start the previously used streaming plugin?\n\n %1 \n\n").arg(streamer_name));
-    QPushButton* yes = msgBox.addButton(tr("Yes"), QMessageBox::YesRole);
-    QPushButton* no = msgBox.addButton(tr("No"), QMessageBox::RejectRole);
-    msgBox.setDefaultButton(yes);
-    msgBox.exec();
+    bool do_start = _autostart_streamer;
+    if (!do_start)
+    {
+      QMessageBox msgBox(this);
+      msgBox.setWindowTitle("Start Streaming?");
+      msgBox.setText(
+          tr("Start the previously used streaming plugin?\n\n %1 \n\n").arg(streamer_name));
+      QPushButton* yes = msgBox.addButton(tr("Yes"), QMessageBox::YesRole);
+      QPushButton* no = msgBox.addButton(tr("No"), QMessageBox::RejectRole);
+      msgBox.setDefaultButton(yes);
+      msgBox.exec();
+      do_start = (msgBox.clickedButton() == yes);
+    }
 
-    if (msgBox.clickedButton() == yes)
+    if (do_start)
     {
       if (dataStreamers().count(streamer_name) != 0)
       {

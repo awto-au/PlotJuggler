@@ -132,6 +132,7 @@ private:
   TransformsMap _transform_functions;
 
   QString _default_streamer;
+  bool _autostart_streamer;
 
   ParserFactories _parser_factories;
 
