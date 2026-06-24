@@ -190,11 +190,19 @@ bool UDP_Server::start(QStringList*)
   dialog.ui->comboBoxProtocol->setCurrentText(protocol);
   onComboChanged(protocol);
 
-  int res = dialog.exec();
-  if (res == QDialog::Rejected)
+  // Skip dialog when autostart is requested (e.g. via --autostart-streamer flag).
+  // Stored QSettings values (address, port, protocol) are used as-is.
+  bool autostart = settings.value("UDP_Server::autostart", false).toBool();
+  settings.remove("UDP_Server::autostart");
+
+  if (!autostart)
   {
-    _running = false;
-    return false;
+    int res = dialog.exec();
+    if (res == QDialog::Rejected)
+    {
+      _running = false;
+      return false;
+    }
   }
 
   address_str = dialog.ui->lineEditAddress->text();
