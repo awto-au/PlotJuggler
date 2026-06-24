@@ -906,6 +906,13 @@ void MainWindow::initializePlugins()
           "QLabel { background: #c0392b; color: white; font-weight: bold; padding: 2px 8px; }");
       _port_controlled_label->setVisible(false);
       statusBar()->addPermanentWidget(_port_controlled_label);
+
+      // Start the control server immediately and independently of whichever
+      // data streamer the user selects.  DataStreamer is in plotjuggler_base
+      // (linked at compile time) so we can cast and call directly.
+      auto* ws_streamer = dynamic_cast<DataStreamer*>(_ws_control);
+      if (ws_streamer)
+        ws_streamer->start(nullptr);
     }
   }
 }
