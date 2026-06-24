@@ -126,7 +126,8 @@ bool UDP_Server::startSocket(const QString& address_str, int port)
 
   if (!address.isMulticast())
   {
-    success &= _udp_socket->bind(address, port);
+    success &= _udp_socket->bind(address, port,
+                                 QAbstractSocket::ShareAddress | QAbstractSocket::ReuseAddressHint);
   }
   else
   {

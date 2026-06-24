@@ -3639,7 +3639,7 @@ void MainWindow::on_buttonStreamingOptions_clicked()
   {
     menu->addAction(action);
   }
-  menu->show();
+  menu->exec();
 }
 
 void MainWindow::on_buttonHideFileFrame_clicked()
