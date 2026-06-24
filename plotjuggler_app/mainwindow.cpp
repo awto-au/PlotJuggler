@@ -2209,10 +2209,6 @@ bool MainWindow::loadLayoutFromFile(QString filename, bool load_datafiles)
           }
         }
 
-        if (_autostart_streamer)
-        {
-          QSettings().setValue("UDP_Server::autostart", true);
-        }
         startStreamingPlugin(streamer_name);
       }
       else
